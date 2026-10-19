@@ -21,7 +21,7 @@ permissions:
 jobs:
   grab:
     # 只在作者账号的仓库运行;别人 fork 后即使启用工作流也会直接跳过
-    if: github.repository_owner == 'ynkmsy'
+    if: github.repository_owner == 'lucy1009'
     runs-on: ubuntu-latest
     timeout-minutes: 8
     env:
