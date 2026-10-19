@@ -133,17 +133,46 @@ const badNode = (info) => {
   return hit ? `黑名单 ${hit}` : null;
 };
 const nodeLabel = (loc) => loc.hosts[0] || (loc.info.match(/node\d*-[a-z]+[a-z0-9.-]*/) || ['未知节点'])[0];
+// 删除请求记录：409 一直删不掉时记下来，下次运行继续跟进，避免"正在删除"被永远跳过
+const DELETES_FILE = (COOLDOWN_FILE.split('/').slice(0, -1).join('/') || '.') + '/deletes.json';
+const DELETE_RETRY_MIN = Number(env.DELETE_RETRY_MINUTES || 30); // 上次请求删除超过这么久还没消失，就再删一次
+function loadDeletes() {
+  try { return JSON.parse(fs.readFileSync(DELETES_FILE, 'utf8')); } catch { return {}; }
+}
+function saveDeletes(st) {
+  try {
+    fs.mkdirSync(DELETES_FILE.split('/').slice(0, -1).join('/') || '.', { recursive: true });
+    fs.writeFileSync(DELETES_FILE, JSON.stringify(st));
+  } catch {}
+}
+function markDeleteRequested(id) {
+  const st = loadDeletes();
+  st[id] = Date.now();
+  saveDeletes(st);
+}
+function clearDeleteRecord(id) {
+  const st = loadDeletes();
+  if (st[id] !== undefined) { delete st[id]; saveDeletes(st); }
+}
+
 // 删除服务器；创建/部署中会返回 409，等它完成再删（最多等 DELETE_WAIT 秒）
+// 409 一直持续则不再抛错：记录删除请求并返回 'pending'，由后续运行继续跟进
 async function deleteBot(id) {
   const end = Date.now() + Number(env.DELETE_WAIT || 180) * 1000;
   while (true) {
     try {
       await api(`/api/v1/panel/bots/${encodeURIComponent(id)}/actions`, { method: 'POST', body: { action: 'delete' } });
       log('已提交删除', id);
+      markDeleteRequested(id);
       return true;
     } catch (e) {
-      if (e.status === 404) return true;
-      if (e.status !== 409 || Date.now() > end) throw e;
+      if (e.status === 404) { clearDeleteRecord(id); return true; }
+      if (e.status === 409 && Date.now() > end) {
+        log('删除一直返回 409（超过等待时间），已记录请求，稍后运行继续跟进', id);
+        markDeleteRequested(id);
+        return 'pending';
+      }
+      if (e.status !== 409) throw e;
       log('有操作进行中，5 秒后重试删除');
       await sleep(5);
     }
@@ -157,16 +186,28 @@ async function handleExisting(notify = true) {
   const kept = [];
   let unknown = false;
   for (const b of bots) {
-    if (/delet/i.test(String(b.status || b.state || b.operation?.phase || ''))) { log(`${b.name || b.id} 正在删除，忽略`); continue; }
+    if (/delet/i.test(String(b.status || b.state || b.operation?.phase || ''))) {
+      const requestedAt = loadDeletes()[b.id];
+      if (!requestedAt || Date.now() - requestedAt < DELETE_RETRY_MIN * 60000) {
+        log(`${b.name || b.id} 正在删除，忽略`);
+        continue;
+      }
+      log(`${b.name || b.id} 删除请求已超过 ${DELETE_RETRY_MIN} 分钟仍未消失，重新尝试删除`);
+      // 不 continue，往下走正常流程重新删除
+    }
     const loc = await botLocation(b.id, 5);
-    if (loc.gone) { log(`${b.name || b.id} 已删除，忽略`); continue; }
+    if (loc.gone) { clearDeleteRecord(b.id); log(`${b.name || b.id} 已删除，忽略`); continue; }
     if (!loc.info) { log(`${b.name || b.id} 读不到节点，本次不处理`); unknown = true; continue; }
     const bad = badNode(loc.info);
     if (bad) {
       log(`已有服务器 ${b.name || b.id} 节点不合格（${bad}），删除`);
-      await deleteBot(b.id);
+      const delResult = await deleteBot(b.id);
       startCooldown();
-      await tg(`🗑 Botkeep：${esc(b.name || b.id)} 在 ${nodeLink(loc)}（${esc(bad)}），已删除，暂停 ${COOLDOWN_MIN} 分钟后继续抢。`);
+      if (delResult === 'pending') {
+        await tg(`⏳ Botkeep：${esc(b.name || b.id)} 在 ${nodeLink(loc)}（${esc(bad)}），删除请求已提交但对方一直忙，已记录稍后继续跟进，暂停 ${COOLDOWN_MIN} 分钟。`);
+      } else {
+        await tg(`🗑 Botkeep：${esc(b.name || b.id)} 在 ${nodeLink(loc)}（${esc(bad)}），已删除，暂停 ${COOLDOWN_MIN} 分钟后继续抢。`);
+      }
       throw new Cooldown();
     } else kept.push(`${esc(b.name || b.id)} @ ${nodeLink(loc)}`);
   }
@@ -389,9 +430,13 @@ async function main() {
         const bad = badNode(loc.info);
         if (bad) {
           log(`节点不合格（${bad}），删除并暂停 ${COOLDOWN_MIN} 分钟`);
-          await deleteBot(id);
+          const delResult = await deleteBot(id);
           startCooldown();
-          await tg(`🗑 Botkeep：抢到的机器在 ${nodeLink(loc)}（${esc(bad)}），已删除，暂停 ${COOLDOWN_MIN} 分钟后继续抢。`);
+          if (delResult === 'pending') {
+            await tg(`⏳ Botkeep：抢到的机器在 ${nodeLink(loc)}（${esc(bad)}），删除请求已提交但对方一直忙，已记录稍后继续跟进，暂停 ${COOLDOWN_MIN} 分钟。`);
+          } else {
+            await tg(`🗑 Botkeep：抢到的机器在 ${nodeLink(loc)}（${esc(bad)}），已删除，暂停 ${COOLDOWN_MIN} 分钟后继续抢。`);
+          }
           return;
         }
         startCooldown(SUCCESS_COOLDOWN_MIN);
