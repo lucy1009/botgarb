@@ -155,9 +155,27 @@ function clearDeleteRecord(id) {
   if (st[id] !== undefined) { delete st[id]; saveDeletes(st); }
 }
 
+// 停掉服务器：未知节点（没分配到节点）的机器可能卡在创建操作中，先发停止/取消动作打断它
+// Botkeep 未公开动作名，stop/cancel 逐个试，失败只打日志、不中断后面的删除流程
+async function tryStopBot(id) {
+  for (const action of ['stop', 'cancel']) {
+    try {
+      await api(`/api/v1/panel/bots/${encodeURIComponent(id)}/actions`, { method: 'POST', body: { action } });
+      log(`已提交 ${action} 动作`, id);
+      await sleep(5);
+      return true;
+    } catch (e) {
+      log(`${action} 动作失败：${e.message}`);
+    }
+  }
+  return false;
+}
+
 // 删除服务器；创建/部署中会返回 409，等它完成再删（最多等 DELETE_WAIT 秒）
 // 409 一直持续或网络请求一直失败则不再抛错：记录删除请求并返回 'pending'，由后续运行继续跟进
-async function deleteBot(id) {
+// stopFirst：未知节点的机器先试停止/取消动作，再删除
+async function deleteBot(id, stopFirst = false) {
+  if (stopFirst) await tryStopBot(id);
   const end = Date.now() + Number(env.DELETE_WAIT || 180) * 1000;
   while (true) {
     try {
@@ -203,7 +221,7 @@ async function handleExisting(notify = true) {
     const bad = badNode(loc.info);
     if (bad) {
       log(`已有服务器 ${b.name || b.id} 节点不合格（${bad}），删除`);
-      const delResult = await deleteBot(b.id);
+      const delResult = await deleteBot(b.id, nodeLabel(loc) === '未知节点');
       startCooldown();
       if (delResult === 'pending') {
         await tg(`⏳ Botkeep：${esc(b.name || b.id)} 在 ${nodeLink(loc)}（${esc(bad)}），删除请求已提交但对方一直忙，已记录稍后继续跟进，暂停 ${COOLDOWN_MIN} 分钟。`);
@@ -432,7 +450,7 @@ async function main() {
         const bad = badNode(loc.info);
         if (bad) {
           log(`节点不合格（${bad}），删除并暂停 ${COOLDOWN_MIN} 分钟`);
-          const delResult = await deleteBot(id);
+          const delResult = await deleteBot(id, nodeLabel(loc) === '未知节点');
           startCooldown();
           if (delResult === 'pending') {
             await tg(`⏳ Botkeep：抢到的机器在 ${nodeLink(loc)}（${esc(bad)}），删除请求已提交但对方一直忙，已记录稍后继续跟进，暂停 ${COOLDOWN_MIN} 分钟。`);
