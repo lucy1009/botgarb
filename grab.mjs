@@ -156,7 +156,7 @@ function clearDeleteRecord(id) {
 }
 
 // 删除服务器；创建/部署中会返回 409，等它完成再删（最多等 DELETE_WAIT 秒）
-// 409 一直持续则不再抛错：记录删除请求并返回 'pending'，由后续运行继续跟进
+// 409 一直持续或网络请求一直失败则不再抛错：记录删除请求并返回 'pending'，由后续运行继续跟进
 async function deleteBot(id) {
   const end = Date.now() + Number(env.DELETE_WAIT || 180) * 1000;
   while (true) {
@@ -167,13 +167,15 @@ async function deleteBot(id) {
       return true;
     } catch (e) {
       if (e.status === 404) { clearDeleteRecord(id); return true; }
-      if (e.status === 409 && Date.now() > end) {
-        log('删除一直返回 409（超过等待时间），已记录请求，稍后运行继续跟进', id);
+      // 无 status = 网络层失败（fetch failed、代理抖动等），与 409 一样在等待时间内重试
+      const retryable = e.status === 409 || e.status == null;
+      if (!retryable) throw e;
+      if (Date.now() > end) {
+        log(e.status === 409 ? '删除一直返回 409（超过等待时间），已记录请求，稍后运行继续跟进' : '删除请求一直网络失败（超过等待时间），已记录请求，稍后运行继续跟进', id);
         markDeleteRequested(id);
         return 'pending';
       }
-      if (e.status !== 409) throw e;
-      log('有操作进行中，5 秒后重试删除');
+      log(e.status === 409 ? '有操作进行中，5 秒后重试删除' : `删除请求网络失败（${e.message || e}），5 秒后重试`);
       await sleep(5);
     }
   }
